@@ -1,6 +1,31 @@
-#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 
-"""Python module that generates .ninja files.
+"""
+The MIT License (MIT)
+
+Copyright (c) 2015-2017 Danny Y.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Python module that generates .ninja files.
 
 Some of the stuff here was borrowed from the main ninja project.
 However this module aims to extend the bare-bones provided with a rich
@@ -8,38 +33,173 @@ python API.
 
 Note: This file is meant to be a single file for easy inclusion for existing
 build systems. Hence this file will be rather big.
+
 """
 
-import textwrap
-import os, sys
-import datetime
+import os
+import io
+import re
+import sys
+import glob
+import shlex
+import errno
 import fnmatch
+import textwrap
+import datetime
+
+##############################################################################
+# The following functions are backports for Python 2.x. Some are modified
+# from the original CPython repository, however retrofitted and backported to
+# Python 2.x themselves.
+##############################################################################
+
+_find_unsafe = re.compile(r'[^a-zA-Z0-9_@%+=:,./-]').search
+
+def quote(s):
+    """Return a shell-escaped version of the string *s*."""
+    if not s:
+        return "''"
+    if _find_unsafe(s) is None:
+        return s
+
+    # use single quotes, and put single quotes into double quotes
+    # the string $'b is then quoted as '$'"'"'b'
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
 try:
-    import cStringIO as StringIO
+    _string_types = basestring
+except NameError:
+    _string_types = str
+
+try:
+    from cStringIO import StringIO as _StringIO
 except ImportError:
-    import io.StringIO as StringIO # python 3k compat
+    _StringIO = io.StringIO
+
+# Check that a given file can be accessed with the correct mode.
+# Additionally check that `file` is not a directory, as on Windows
+# directories pass the os.access check.
+def _access_check(fn, mode):
+    return os.path.exists(fn) and os.access(fn, mode) and not os.path.isdir(fn)
+
+def _ensure_path(path):
+    try:
+        os.makedirs(path)
+    except OSError as exception:
+        if exception.errno != errno.EEXIST:
+            raise
+
+def executables_in_path(matcher=None):
+    path = os.environ.get("PATH", os.defpath)
+
+    if path is None:
+        return
+
+    if matcher is None:
+        matcher = lambda c: True
+
+    path = path.split(os.pathsep)
+
+    if sys.platform == 'win32':
+        if not os.curdir in path:
+            path.insert(0, os.curdir)
+
+    mode = os.F_OK | os.X_OK
+    for directory in path:
+        if not os.path.exists(directory):
+            continue
+
+        for exe in os.listdir(directory):
+            if not matcher(exe):
+                continue
+
+            fn = os.path.realpath(os.path.join(directory, exe))
+            if _access_check(fn, mode):
+                yield fn
+
+def which(cmd):
+    """Given a command, mode, and a PATH string, return the path which
+    conforms to the given mode on the PATH, or None if there is no such
+    file.
+
+    `mode` defaults to os.F_OK | os.X_OK. `path` defaults to the result
+    of os.environ.get("PATH"), or can be overridden with a custom search
+    path.
+
+    """
+
+    # If we're given a path with a directory part, look it up directly rather
+    # than referring to PATH directories. This includes checking relative to the
+    # current directory, e.g. ./script
+    if os.path.dirname(cmd):
+        if _access_check(cmd, mode):
+            return cmd
+        return None
+
+    path = os.environ.get("PATH", os.defpath)
+    mode = os.F_OK | os.X_OK
+    if not path:
+        return None
+    path = path.split(os.pathsep)
+
+    if sys.platform == "win32":
+        # The current directory takes precedence on Windows.
+        if not os.curdir in path:
+            path.insert(0, os.curdir)
+
+        # PATHEXT is necessary to check on Windows.
+        pathext = os.environ.get("PATHEXT", "").split(os.pathsep)
+        # See if the given file matches any of the expected path extensions.
+        # This will allow us to short circuit when given "python.exe".
+        # If it does match, only test that one, otherwise we have to try
+        # others.
+        if any(cmd.lower().endswith(ext.lower()) for ext in pathext):
+            files = [cmd]
+        else:
+            files = [cmd + ext for ext in pathext]
+    else:
+        # On other platforms you don't have things like PATHEXT to tell you
+        # what file suffixes are executable, so just pass on cmd as-is.
+        files = [cmd]
+
+    seen = set()
+    for dir in path:
+        normdir = os.path.normcase(dir)
+        if not normdir in seen:
+            seen.add(normdir)
+            for thefile in files:
+                name = os.path.join(dir, thefile)
+                if _access_check(name, mode):
+                    return name
+    return None
+
+
 
 def escape_path(word):
     return word.replace('$ ', '$$ ').replace(' ', '$ ').replace(':', '$:')
 
-def escape(string):
-    """Escape a string such that it can be embedded into a Ninja file without
-    further interpretation."""
-    assert '\n' not in string, 'Ninja syntax does not allow newlines'
-    # We only have one special metacharacter: '$'.
-    return string.replace('$', '$$')
+class Writer(object):
+    def __init__(self, filename, mode='w', **kwargs):
+        if isinstance(filename, _string_types):
+            self.fp = io.open(filename, mode)
+        else:
+            self.fp = filename # probably a file-like object
 
-class NinjaWriter(object):
-    def __init__(self, output, width=78):
-        self.output = output
-        self.width = width
+        self.width = kwargs.get('width', 78)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, exc, tb):
+        self.close()
 
     def newline(self):
-        self.output.write('\n')
+        self.fp.write('\n')
 
-    def comment(self, text):
-        for line in textwrap.wrap(text, self.width - 2):
-            self.output.write('# ' + line + '\n')
+    def comment(self, text, has_path=False):
+        for line in textwrap.wrap(text, self.width - 2, break_long_words=False,
+                                  break_on_hyphens=False):
+            self.fp.write('# ' + line + '\n')
 
     def variable(self, key, value, indent=0):
         if value is None:
@@ -75,7 +235,7 @@ class NinjaWriter(object):
             self.variable('deps', deps, indent=1)
 
     def build(self, outputs, rule, inputs=None, implicit=None, order_only=None,
-              variables=None):
+              variables=None, implicit_outputs=None):
         outputs = self._as_list(outputs)
         out_outputs = [escape_path(x) for x in outputs]
         all_inputs = [escape_path(x) for x in self._as_list(inputs)]
@@ -88,6 +248,11 @@ class NinjaWriter(object):
             order_only = [escape_path(x) for x in self._as_list(order_only)]
             all_inputs.append('||')
             all_inputs.extend(order_only)
+        if implicit_outputs:
+            implicit_outputs = [escape_path(x)
+                                for x in self._as_list(implicit_outputs)]
+            out_outputs.append('|')
+            out_outputs.extend(implicit_outputs)
 
         self._line('build %s: %s' % (' '.join(out_outputs),
                                      ' '.join([rule] + all_inputs)))
@@ -149,182 +314,267 @@ class NinjaWriter(object):
                 # Give up on breaking.
                 break
 
-            self.output.write(leading_space + text[0:space] + ' $\n')
+            self.fp.write(leading_space + text[0:space] + ' $\n')
             text = text[space+1:]
 
             # Subsequent lines are continuations, so indent them.
             leading_space = '  ' * (indent+2)
 
-        self.output.write(leading_space + text + '\n')
+        self.fp.write(leading_space + text + '\n')
 
-    def _as_list(self, input):
-        if input is None:
+    def close(self):
+        self.fp.close()
+
+    def escape(self, string):
+        """Escape a string such that it can be embedded into a Ninja file without
+        further interpretation."""
+        assert '\n' not in string, 'Ninja syntax does not allow newlines'
+        # We only have one special metacharacter: '$'.
+        return string.replace('$', '$$')
+
+    def expand(self, string, vars, local_vars={}):
+        """Expand a string containing $vars as Ninja would.
+
+        Note: doesn't handle the full Ninja variable syntax, but it's enough
+        to make configure.py's use of it work.
+        """
+        def exp(m):
+            var = m.group(1)
+            if var == '$':
+                return '$'
+            return local_vars.get(var, vars.get(var, ''))
+        return re.sub(r'\$(\$|\w*)', exp, string)
+
+    def _as_list(self, l):
+        if l is None:
             return []
-        if isinstance(input, list):
-            return input
-        return [input]
+        if isinstance(l, list):
+            return l
+        return [l]
 
-"""Represents the default compiler"""
 class Compiler(object):
+    """Represents a C++ compiler object.
+
+    By default, this is a GCC-like compiler.
+    """
+
     def __init__(self, name):
         self.name = name
 
-    def rules(self, ninja):
-        ninja.rule('compile', command = '$cxx -MMD -MF $out.d -c $cxxflags $includes $depends $defines $in -o $out',
-                              deps = 'gcc', depfile = '$out.d',
-                              description = 'Compiling $in to $out')
-        ninja.rule('link', command = '$cxx $cxxflags $in -o $out $linkflags $libpath $libraries', description = 'Creating $out')
+    def __eq__(self, other):
+        return isinstance(other, Compiler) and other.name == self.name
+
+    def __ne__(self, other):
+        return not isinstance(other, Compiler) or other.name != self.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __repr__(self):
+        return '<Compiler name=%r>' % self.name
+
+    def setup_rules(self, ninja):
+        ninja.rule('compile', command='$cxx -MMD -MF $out.d -c $cxxflags $includes $depends $defines $in -o $out',
+                              deps='gcc', depfile='$out.d',
+                              description='Compiling $in to $out')
+        ninja.rule('link', command='$cxx $cxxflags $in -o $out $linkflags $libpath $libraries',
+                           description='Creating $out')
+
+    @classmethod
+    def detected(cls):
+        """Returns Compiler instances that are detected on the machine."""
+        matcher = lambda g: g.startswith(('g++', 'clang++'))
+        return { cls(exe) for exe in executables_in_path(matcher) }
+
+    @classmethod
+    def from_name(cls, name):
+        exe = which(name)
+        if exe is None:
+            raise RuntimeError('Compiler %s not found in PATH' % name)
+        return cls(exe)
 
     def object_file(self, filename):
         (root, _) = os.path.splitext(filename)
         return root + '.o'
 
     def include(self, path):
-        return "-I\"{}\"".format(path)
+        return '-I' + quote(path)
 
     def libpath(self, path):
-        return "-L\"{}\"".format(path)
+        return '-L' + quote(path)
 
     def library(self, lib):
-        return "-l" + lib
+        return '-l' + lib
 
     def dependency(self, dep):
-        return "-isystem \"{}\"".format(dep)
+        return '-isystem ' + quote(dep)
 
     def define(self, macro):
-        return "-D " + macro
+        return '-D ' + macro
 
+gcc = Compiler('g++')
+clang = Compiler('clang++')
 
-def compiler(name):
-    if name == 'cl' or 'msvc' in name:
-        raise NotImplementedError('MSVC compilers are not supported yet')
-    return Compiler(name=name)
+class CompilationSettings(object):
+    def __init__(self):
+        self._flags = []
+        self._link_flags = []
+        self._libraries = []
+        self._dependencies = []
+        self._includes = []
+        self._defines = []
 
-"""Represents the base class for all sen.py classes"""
-class Options(object):
-    def __init__(self, *args, **kwargs):
-        self.flags = None
-        self.link_flags = None
-        self.libraries = None
-        self.library_paths = None
-        self.dependencies = None
-        self.includes = None
-        self.defines = None
+    def add_libraries(self, *libraries):
+        if libraries:
+            self._libraries.extend(libraries)
 
-"""Represents an executable to be made."""
-class Executable(Options):
+    def add_flags(self, *flags):
+        if flags:
+            self._flags.extend(flags)
+
+    def add_includes(self, *includes):
+        if includes:
+            self._includes.extend(includes)
+
+    def add_defines(self, *defines):
+        pass
+
+class Executable(CompilationSettings):
+    """Represents an executable being generated."""
+
     def __init__(self, name, **kwargs):
-        Options.__init__(self, kwargs)
-        self.name = name # the executable name
-        self.builddir = kwargs.get('builddir', None) # the executable specific output directory
-        self.objdir   = kwargs.get('objdir', None)   # the executable specific object directory
-        self.target   = kwargs.get('target', None)
-        self.files    = None
-        self.run      = kwargs.get('run', None) # the name of the target that runs the executable
-
-# monadic functions
-def to_flags(flags):
-    if flags == None:
-        return None
-    return ' '.join(flags)
-
-def fmap(function, iterable):
-    if iterable == None:
-        return None
-    return map(function, iterable)
-
-# utility functions
-def generate_files_from(directory, glob):
-    for root, directories, files in os.walk(directory):
-        for f in files:
-            if fnmatch.fnmatch(f, glob):
-                yield os.path.join(root, f)
-
-def files_from(directory, glob):
-    return list(generate_files_from(directory, glob))
-
-"""Represents a project. Usually only one is needed"""
-class Project(Options):
-    def __init__(self, name, compiler, **kwargs):
-        Options.__init__(self, kwargs)
+        super(Executable, self).__init__()
         self.name = name
-        self.compiler = compiler
-        self.executables = []
-        self.sstream = StringIO.StringIO()
-        self.ninja = NinjaWriter(self.sstream)
-        self.builddir = kwargs.get('builddir', '.')
-        self.objdir   = kwargs.get('objdir', '.')
+        self.output_directory = os.path.abspath(kwargs.pop('output_directory', '.'))
+        self.phony = kwargs.pop('phony', None)
+        self._files = []
+        self._runners = []
 
-    def __create_variable_map(self, options):
-        return {
-            'cxxflags': to_flags(options.flags),
-            'includes': to_flags(fmap(self.compiler.include, options.includes)),
-            'depends': to_flags(fmap(self.compiler.dependency, options.dependencies)),
-            'defines': to_flags(fmap(self.compiler.define, options.defines)),
-            'linkflags': to_flags(options.link_flags),
-            'libpath': to_flags(fmap(self.compiler.libpath, options.library_paths)),
-            'libraries': to_flags(fmap(self.compiler.library, options.libraries))
+    def add_files(self, files):
+        if isinstance(files, _string_types):
+            files = glob.glob(files)
+
+        if files:
+            self._files.extend(files)
+
+    def add_file(self, file):
+        self._files.append(file)
+
+    def create_runner(self, name, arguments=None):
+        if arguments is None:
+            t = (name, [])
+        else:
+            t = (name, list(arguments))
+
+        self._runners.append(t)
+
+    def _generate(self, project):
+        if not self._files:
+            return
+
+        compiler = project.compiler
+
+        variables = {
+            'cxxflags': ' '.join(self._flags),
+            'includes': ' '.join(compiler.include(a) for a in self._includes),
+            'depends': ' '.join(compiler.dependency(a) for a in self._dependencies),
+            'libraries': ' '.join(compiler.library(a) for a in self._libraries),
+            'defines': ' '.join(compiler.define(a) for a in self._defines),
         }
 
-    def variables(self, **kwargs):
-        for k, v in kwargs.items():
-            if v == None:
-                self.ninja.variable(k, ' ')
-            else:
-                self.ninja.variable(k, v)
+        object_files = []
+        object_directory = os.path.join(self.output_directory, 'obj')
+
+        _ensure_path(object_directory)
+
+        # add compile rules for every file in the executable
+        for f in self._files:
+            obj = os.path.normpath(os.path.join(object_directory, compiler.object_file(f)))
+            project.build(obj, 'compile', inputs=f, variables=variables)
+            object_files.append(obj)
+
+        # link the files together
+        resulting_binary = os.path.normpath(os.path.join(self.output_directory, self.name))
+        project.build(resulting_binary, 'link', inputs=object_files, variables=variables)
+
+        if self.phony is not None:
+            project.build(self.phony, 'phony', inputs=resulting_binary)
+
+        for name, arguments in self._runners:
+            runner_name = '%s_%s_runner' % (self.name, name)
+            args = [resulting_binary]
+            args.extend(quote(a) for a in arguments)
+            project.rule(runner_name, command=' '.join(args))
+            project.build(name, runner_name, implicit=resulting_binary)
+
+        project.newline()
+
+class Project(Writer):
+    """Maintains the project.
+
+    Can contain different executables or libraries.
+
+    This is a subclass of the Ninja writer.
+    """
+
+    def __init__(self, filename, **kwargs):
+        compiler = kwargs.pop('compiler', None)
+        if not isinstance(compiler, Compiler):
+            raise TypeError('compiler must be Compiler, not ' + type(compiler).__name__)
+
+        self.compiler = compiler
+        self._original_filename = filename
+        self._executables = []
+        fp = _StringIO()
+        super(Project, self).__init__(fp, **kwargs)
+
+    def __del__(self):
+        # just in case
+        self.close()
+
+    def generate(self, **kwargs):
+        """Generates the .ninja file.
+
+        This can only be done once.
+        """
+
+        # keyword only argument emulation for Python 2.x
+        bootstrap = kwargs.pop('bootstrap', False)
+        if len(kwargs) != 0:
+            raise TypeError('generate() got unexpected keyword arguments')
+
+        now = datetime.datetime.utcnow()
+        self.comment('This file was generated automatically on %s UTC using ' \
+                     'the sen.py script. Do not modify.' % now.isoformat())
+
+        self.newline()
+        self.variable('ninja_required_version', '1.3')
+        self.variable('cxx', self.compiler.name)
+
+        # TODO: builddir variable?
+
+        self.newline()
+        self.compiler.setup_rules(self)
+        self.newline()
+
+        if bootstrap:
+            argv = sys.argv[:]
+            argv.insert(0, sys.executable)
+            self.rule('bootstrap', command=' '.join(argv), generator=True)
+            self.build(self._original_filename, 'bootstrap', implicit=argv[1])
+
+        for executable in self._executables:
+            executable._generate(self)
+
+        to_write = self.fp.getvalue().encode('utf-8')
+
+        # if we're here then our generation went okay so replace
+        # the file with the actual generated one.
+        with io.open(self._original_filename, 'wb') as fp:
+            fp.write(to_write)
 
     def add_executable(self, exe):
         if not isinstance(exe, Executable):
-            raise ValueError("argument passed must be an 'Executable'")
-        self.executables.append(exe)
+            raise TypeError('expected Executable, received %s instead' % type(exe).__name__)
 
-    def dump(self, stream, generator=True):
-        # create the global variables needed
-        today = datetime.datetime.today()
-        self.ninja.comment("This file was generated automatically on {} using"
-                           " the sen.py meta build system. Do not modify this.".format(today.isoformat(' ')))
-        self.ninja.variable('ninja_required_version', '1.3')
-        self.ninja.variable('cxx', self.compiler.name)
-        self.ninja.variable('builddir', self.builddir) # the project builddir
-
-        # process the global variables
-        project_variables = self.__create_variable_map(self)
-        self.variables(**project_variables)
-
-        # register the global rules
-        self.compiler.rules(self.ninja)
-        if generator == True:
-            self.ninja.rule('bootstrap', command=' '.join(['python'] + sys.argv), generator=True)
-            self.ninja.build(stream.name, 'bootstrap', implicit=sys.argv[0])
-
-        # register the executables requested
-        for exe in self.executables:
-            if exe.files == None:
-                continue
-
-            exe_variables = self.__create_variable_map(exe)
-
-            # compile the files in the project
-            object_files = []
-            objdir = exe.objdir if exe.objdir else self.objdir
-            for filename in exe.files:
-                obj = os.path.join(objdir, self.compiler.object_file(filename))
-                self.ninja.build(obj, 'compile', inputs=filename, variables=exe_variables)
-                object_files.append(obj)
-
-            # final link step
-            builddir = exe.builddir if exe.builddir else self.builddir
-            self.ninja.build(os.path.join(builddir, exe.name), 'link', inputs=object_files, variables=exe_variables)
-            if exe.target != None:
-                self.ninja.build(exe.target, 'phony', inputs=os.path.join(builddir, exe.name))
-
-            # register the runner
-            if exe.run != None:
-                self.ninja.rule(exe.name + '_runner', command=os.path.join(builddir, exe.name))
-                self.ninja.build(exe.run, exe.name + '_runner', implicit=exe.target)
-
-        # finalise the creation
-        result = self.sstream.getvalue()
-        stream.write(result)
-        self.sstream = StringIO.StringIO()
-        self.ninja = NinjaWriter(self.sstream)
+        self._executables.append(exe)

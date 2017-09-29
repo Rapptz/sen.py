@@ -515,6 +515,14 @@ class Project(Writer):
     Can contain different executables or libraries.
 
     This is a subclass of the Ninja writer.
+
+    Parameters
+    ------------
+    compiler: :class:`Compiler`
+        The compiler to use for this project.
+    builddir: str
+        The builddir to use for the ninja script.
+        This is where ninja log files are stored.
     """
 
     def __init__(self, filename, **kwargs):
@@ -523,6 +531,7 @@ class Project(Writer):
             raise TypeError('compiler must be Compiler, not ' + type(compiler).__name__)
 
         self.compiler = compiler
+        self.builddir = kwargs.get('builddir', None)
         self._original_filename = filename
         self._executables = []
         fp = _StringIO()
@@ -536,6 +545,11 @@ class Project(Writer):
         """Generates the .ninja file.
 
         This can only be done once.
+
+        Parameters
+        ----------
+        bootstrap: bool
+            Whether to add a bootstrap rule.
         """
 
         # keyword only argument emulation for Python 2.x
@@ -551,7 +565,9 @@ class Project(Writer):
         self.variable('ninja_required_version', '1.3')
         self.variable('cxx', self.compiler.name)
 
-        # TODO: builddir variable?
+        if self.builddir is not None:
+            _ensure_path(self.builddir)
+            self.variable('builddir', self.builddir)
 
         self.newline()
         self.compiler.setup_rules(self)
